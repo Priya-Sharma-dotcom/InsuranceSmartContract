@@ -1,105 +1,131 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
-contract insurancePolicy {
+contract Insurance {
 
-    address public insurerAdd;
-    uint public policyCounter;
-    uint public claimCounter;
+    address public insurer;
+
+    enum Reason { Hospitalization, Accident, Surgery }
+    enum ClaimStatus { Pending, Approved, Rejected, Paid }
 
     constructor() {
-        insurerAdd = msg.sender;
+        insurer = msg.sender;
     }
 
-    modifier OnlyInsurer() {
-        require(msg.sender == insurerAdd, "ONLY INSURER CAN CALL THIS FUNCTION");
+    modifier onlyInsurer() {
+        require(msg.sender == insurer, "Only insurer allowed");
         _;
     }
 
-    modifier OnlyPolicyHolder(address _policyholder) {
-        require(msg.sender == _policyholder, "ONLY POLICYHOLDER CAN CALL THIS FUNCTION");
+    modifier onlyPolicyHolder(address policyHolder) {
+        require(msg.sender == policyHolder, "Only policyholder allowed");
         _;
     }
 
     struct Policy {
-        address policyholder;
         uint premiumAmount;
         uint coverageAmount;
-        uint policyDuration;
+        address policyHolder;
         uint startTime;
+        uint duration;
         bool isActive;
+        bool isPremiumPaid;
     }
 
     struct Claim {
-        uint policyID;
-        string reason;
+        uint policyId;
+        Reason reason;
         uint claimAmount;
-        bool isApproved;
-        bool isPaid;
+        ClaimStatus status;
     }
 
-    mapping(uint => Policy) public InsurancePolicy;
+    mapping(uint => Policy) public policies;
     mapping(uint => Claim) public claims;
 
-    event PolicyIssued(uint policyID, address policyholder);
-    event PremiumPaid(uint policyID, uint premium, address payer);
-    event ClaimSubmitted(uint policyID, uint claimId, uint amount);
-    event ClaimApproved(uint claimID);
-    event ClaimPaid(uint claimId);
+    uint public policyCounter;
+    uint public claimCounter;
 
-    function issuePolicy(
-        address _PolicyHolderAddress,
-        uint _premiumAmount,
-        uint _coverageAmount,
-        uint _policyDuration
-    ) public OnlyInsurer {
+    event PolicyIssued(uint policyId, address policyHolder);
+    event PremiumPaid(uint policyId, address policyHolder, uint amount);
+    event ClaimSubmitted(uint claimId, uint policyId, address policyHolder);
+    event ClaimApproved(uint claimId);
+    event ClaimRejected(uint claimId);
+    event ClaimPaid(uint claimId, uint amount);
+
+    function issuePolicy(address PolicyHolder,uint premiumAmount, uint coverageAmount, uint duration) public onlyInsurer {
         policyCounter++;
-        InsurancePolicy[policyCounter] = Policy(
-            _PolicyHolderAddress,
-            _premiumAmount,
-            _coverageAmount,
-            _policyDuration,
+        policies[policyCounter] = Policy(
+            premiumAmount,
+            coverageAmount,
+            PolicyHolder,
             block.timestamp,
-            true
+            duration,
+            true,
+            false
         );
-        emit PolicyIssued(policyCounter, _PolicyHolderAddress);
+        emit PolicyIssued(policyCounter, msg.sender);
     }
 
-    function payPremium(uint _policyId) public payable OnlyPolicyHolder(InsurancePolicy[_policyId].policyholder) {
-        require(msg.value == InsurancePolicy[_policyId].premiumAmount, "Premium Amount incorrect");
-        require(InsurancePolicy[_policyId].isActive, "Policy is not active");
-        emit PremiumPaid(_policyId, msg.value, msg.sender);
+    function payPremium(uint policyId) public payable onlyPolicyHolder(policies[policyId].policyHolder) {
+        Policy storage policy = policies[policyId];
+        require(policy.isActive, "Policy not active");
+        require(msg.value == policy.premiumAmount, "Incorrect premium");
+
+        policy.isPremiumPaid = true;
+        payable(insurer).transfer(msg.value);
+
+        emit PremiumPaid(policyId, msg.sender, msg.value);
     }
 
-    function submitClaim(
-        uint _policyId,
-        string memory _reason,
-        uint _claimAmount
-    ) public OnlyPolicyHolder(InsurancePolicy[_policyId].policyholder) {
-        require(
-            block.timestamp <= InsurancePolicy[_policyId].startTime + InsurancePolicy[_policyId].policyDuration,
-            "POLICY EXPIRED"
-        );
-        require(InsurancePolicy[_policyId].isActive, "POLICY IS NOT ACTIVE");
-
+    function submitClaim(uint policyId, uint claimAmount, Reason reason) public onlyPolicyHolder(policies[policyId].policyHolder) {
         claimCounter++;
-        claims[claimCounter] = Claim(_policyId, _reason, _claimAmount, false, false);
-        emit ClaimSubmitted(_policyId, claimCounter, _claimAmount);
+        claims[claimCounter] = Claim(policyId, reason, claimAmount, ClaimStatus.Pending);
+        emit ClaimSubmitted(claimCounter, policyId, msg.sender);
     }
 
-    function approveClaim(uint _claimID) public OnlyInsurer {
-        require(!claims[_claimID].isApproved, "Claim already approved");
-        claims[_claimID].isApproved = true;
-        emit ClaimApproved(_claimID);
+    function approveClaim(uint claimId) public onlyInsurer {
+        Claim storage claim = claims[claimId];
+        Policy storage policy = policies[claim.policyId];
+
+        require(block.timestamp <= policy.startTime + policy.duration, "Policy expired");
+        require(policy.isActive, "Policy inactive");
+        require(policy.isPremiumPaid, "Premium not paid");
+        require(claim.claimAmount <= policy.coverageAmount, "Claim exceeds coverage");
+        require(claim.status == ClaimStatus.Pending, "Already processed");
+
+        claim.status = ClaimStatus.Approved;
+        emit ClaimApproved(claimId);
     }
 
-    function payClaim(uint _claimID) public payable OnlyInsurer {
-        require(claims[_claimID].isApproved, "CLAIM IS NOT APPROVED");
-        require(!claims[_claimID].isPaid, "CLAIM ALREADY PAID");
-        require(msg.value == claims[_claimID].claimAmount, "Incorrect payout amount");
+    function rejectClaim(uint claimId) public onlyInsurer {
+        Claim storage claim = claims[claimId];
+        Policy storage policy = policies[claim.policyId];
 
-        payable(InsurancePolicy[claims[_claimID].policyID].policyholder).transfer(claims[_claimID].claimAmount);
-        claims[_claimID].isPaid = true;
-        emit ClaimPaid(_claimID);
+        // Rejection if any of the following fails
+        if (
+            block.timestamp > policy.startTime + policy.duration ||
+            !policy.isActive ||
+            !policy.isPremiumPaid ||
+            claim.claimAmount > policy.coverageAmount
+        ) {
+            claim.status = ClaimStatus.Rejected;
+            emit ClaimRejected(claimId);
+        } else {
+            revert("Claim cannot be rejected: all conditions are valid");
+        }
+    }
+
+    function payClaim(uint claimId) public payable onlyInsurer {
+        Claim storage claim = claims[claimId];
+        Policy storage policy = policies[claim.policyId];
+
+        require(claim.status == ClaimStatus.Approved, "Claim not approved");
+        require(msg.value == claim.claimAmount, "Incorrect amount");
+        require(claim.status != ClaimStatus.Paid, "Already paid");
+
+        claim.status = ClaimStatus.Paid;
+        payable(policy.policyHolder).transfer(msg.value);
+
+        emit ClaimPaid(claimId, msg.value);
     }
 }
